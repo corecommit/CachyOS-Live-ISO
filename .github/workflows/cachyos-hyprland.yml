@@ -14,8 +14,9 @@ jobs:
       options: --privileged
 
     steps:
-      - name: Install Build Dependencies
+      - name: Install Base Build Dependencies
         run: |
+          # We install these from the standard Arch repos before adding CachyOS
           pacman -Sy --noconfirm archiso mkinitcpio-archiso git squashfs-tools grub syslinux gnupg
 
       - name: Clone Upstream CachyOS Repo
@@ -24,14 +25,19 @@ jobs:
           rm -rf cachyos
           # 2. Clone the official repo directly into the 'cachyos' folder
           git clone --depth 1 https://github.com/CachyOS/CachyOS-Live-ISO.git cachyos
-          # 3. Fix permissions for the builder user
-          chown -R builder:builder cachyos || true
 
       - name: Initialize CachyOS Keyring and Repositories
         run: |
           pacman-key --init
           pacman-key --populate archlinux
+          
+          # Add the CachyOS repository to pacman.conf
           printf '\n[cachyos]\nSigLevel = Required DatabaseOptional\nServer = https://mirror.cachyos.org/repo/$arch/$repo\n' >> /etc/pacman.conf
+          
+          # Fetch and locally trust the CachyOS signing key (FIX FOR PGP ERROR)
+          pacman-key --recv-keys F3B607488DB35A47 --keyserver keyserver.ubuntu.com
+          pacman-key --lsign-key F3B607488DB35A47
+          
           pacman -Sy --noconfirm
           pacman -S --noconfirm cachyos-keyring
           pacman-key --populate cachyos
@@ -41,6 +47,7 @@ jobs:
         run: |
           useradd -m builder
           echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+          # Give the builder ownership of the cloned source code and output directory
           mkdir -p cachyos/out
           chown -R builder:builder cachyos
 
@@ -51,7 +58,7 @@ jobs:
           sudo -u builder gpg --list-secret-keys --keyid-format=long
 
       # ------------------------------------------------------------------
-      # PATCHES START HERE (Paths updated to 'cachyos/')
+      # PATCHES START HERE
       # ------------------------------------------------------------------
       - name: Patch Package List
         run: |
@@ -100,7 +107,7 @@ jobs:
             fi
           done
 
-          # GUARD
+          # GUARD: Fail if any critical package is missing
           missing=0
           for pkg in hyprland pipewire pipewire-pulse wireplumber networkmanager \
               wpa_supplicant mkinitcpio mkinitcpio-archiso linux-cachyos \
@@ -128,6 +135,8 @@ jobs:
       - name: Patch airootfs
         run: |
           AIROOT="cachyos/archiso/airootfs"
+          
+          # Delete Plasma leftovers
           rm -f  "$AIROOT/etc/plasmalogin.conf"
           rm -rf "$AIROOT/etc/plasmalogin.conf.d"
           rm -f  "$AIROOT/etc/pacman.d/hooks/90-cachyos-live-kwin-keyboard.hook"
@@ -141,6 +150,7 @@ jobs:
           rm -f  "$AIROOT/etc/skel/.config/powermanagementprofilesrc"
           rm -rf "$AIROOT/etc/skel/.config/systemd/user/plasma-login-kwin_wayland.service.d"
 
+          # Add greetd config
           mkdir -p "$AIROOT/etc/greetd"
           cat > "$AIROOT/etc/greetd/config.toml" <<'GREETD'
           [terminal]
@@ -150,6 +160,7 @@ jobs:
           user = "greeter"
           GREETD
 
+          # Add minimal Hyprland config
           mkdir -p "$AIROOT/etc/skel/.config/hypr"
           cat > "$AIROOT/etc/skel/.config/hypr/hyprland.conf" <<'HYPR'
           monitor=,preferred,auto,auto
@@ -185,6 +196,7 @@ jobs:
           rm -rf build/ work/ out/*
 
           set +e
+          # Build with GPG signing
           sudo -H -E -u builder ./buildiso.sh -p desktop -v -w -g "${{ secrets.GPG_KEY_ID }}"
           build_rc=$?
           set -e
