@@ -109,8 +109,8 @@ jobs:
           # 1. Swap display manager
           sed -i 's|/usr/lib/systemd/system/plasmalogin\.service|/usr/lib/systemd/system/greetd.service|g' cachyos/util-iso.sh
           
-          # 2. Disable GPG signing completely so it doesn't crash the build
-          sed -i 's|^[[:space:]]*sign_with_key \$f|# sign_with_key $f|g' cachyos/util-iso.sh
+          # 2. Replace the signing command with `true` so it does nothing but keeps the `if` block valid
+          sed -i 's|sign_with_key \$f|true|g' cachyos/util-iso.sh
 
       - name: Patch linux.preset
         run: |
