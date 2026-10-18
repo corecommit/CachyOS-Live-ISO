@@ -53,7 +53,7 @@ jobs:
           gpg --batch --import /tmp/private.key || true
           echo "${{ secrets.GPG_KEY_ID }}:6:" | gpg --import-ownertrust || true
           
-          # Import for builder (needed by buildiso.sh post-processing)
+          # Import for builder
           sudo -u builder gpg --batch --import /tmp/private.key || true
           echo "${{ secrets.GPG_KEY_ID }}:6:" | sudo -u builder gpg --import-ownertrust || true
           
@@ -80,6 +80,8 @@ jobs:
           done
 
           # REMOVE Plasma + installer + bloat + LTS kernel + ZFS
+          # NOTE: We intentionally KEEP syslinux, memtest86+, edk2-shell, squashfs-tools
+          # because mkarchiso validation expects them based on profiledef.sh
           for pkg in cachyos-calamares-next cachyos-cli-installer-new \
               cachyos-hello cachyos-kde-settings \
               plasma-desktop plasma-workspace plasma-nm plasma-pa \
@@ -93,8 +95,7 @@ jobs:
               darkhttpd bind dnsmasq lftp lynx irssi nmap tcpdump \
               traceroute ndisc6 inetutils lsof mc smartmontools nvme-cli \
               sdparm sg3_utils lsscsi dmidecode hwinfo usbmuxd wvdial \
-              gcc fakeroot paru edk2-shell memtest86+ memtest86+-efi \
-              refind syslinux squashfs-tools os-prober ntp avahi nss-mdns \
+              gcc fakeroot paru refind os-prober ntp avahi nss-mdns \
               bolt pcsclite occt linux-atm wireless_tools net-tools \
               imwheel libwnck3 xdg-user-dirs-gtk rxvt-unicode-terminfo \
               inotify-tools ethtool cachyos-fish-config \
@@ -117,7 +118,7 @@ jobs:
               xdg-desktop-portal-hyprland hyprpolkitagent bluez bluez-utils \
               firefox alacritty thunar nano grim slurp greetd greetd-tuigreet \
               sof-firmware linux-firmware grub efibootmgr chwd polkit \
-              cryptsetup lvm2 btrfs-progs e2fsprogs efibootmgr; do
+              cryptsetup lvm2 btrfs-progs e2fsprogs efibootmgr syslinux; do
             if ! grep -qx "$pkg" "$PKG_LIST"; then
               echo "GUARD FAIL: '$pkg' missing" >&2
               missing=1
@@ -198,7 +199,6 @@ jobs:
           rm -rf build/ work/ out/*
 
           set +e
-          # Removed -g flag from this call
           sudo -H -E -u builder ./buildiso.sh -p desktop -v -w
           build_rc=$?
           set -e
