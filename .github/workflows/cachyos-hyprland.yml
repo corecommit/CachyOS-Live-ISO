@@ -47,9 +47,10 @@ jobs:
 
       - name: Import GPG Key for Builder
         run: |
-          # FIXED: Using a pipe instead of process substitution
-          echo "${{ secrets.GPG_PRIVATE_KEY }}" | sudo -u builder gpg --batch --import
-          echo "${{ secrets.GPG_KEY_ID }}:6:" | sudo -u builder gpg --import-ownertrust
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" > /tmp/private.key
+          sudo -u builder gpg --batch --import /tmp/private.key || true
+          rm -f /tmp/private.key
+          echo "${{ secrets.GPG_KEY_ID }}:6:" | sudo -u builder gpg --import-ownertrust || true
           sudo -u builder gpg --list-secret-keys --keyid-format=long
 
       # ------------------------------------------------------------------
