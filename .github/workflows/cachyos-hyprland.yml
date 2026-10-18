@@ -1,0 +1,223 @@
+name: Build CachyOS Hyprland ISO
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'cachyos-v*' # Tag releases like: cachyos-v1.0.0
+
+jobs:
+  build-cachyos-hyprland:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+      options: --privileged
+
+    steps:
+      - name: Install Build Dependencies
+        run: |
+          pacman -Sy --noconfirm archiso mkinitcpio-archiso git squashfs-tools grub syslinux gnupg
+
+      - name: Clone Upstream CachyOS Repo
+        run: |
+          # 1. Delete the folder if it exists from a previous run
+          rm -rf cachyos
+          # 2. Clone the official repo directly into the 'cachyos' folder
+          git clone --depth 1 https://github.com/CachyOS/CachyOS-Live-ISO.git cachyos
+          # 3. Fix permissions for the builder user
+          chown -R builder:builder cachyos || true
+
+      - name: Initialize CachyOS Keyring and Repositories
+        run: |
+          pacman-key --init
+          pacman-key --populate archlinux
+          printf '\n[cachyos]\nSigLevel = Required DatabaseOptional\nServer = https://mirror.cachyos.org/repo/$arch/$repo\n' >> /etc/pacman.conf
+          pacman -Sy --noconfirm
+          pacman -S --noconfirm cachyos-keyring
+          pacman-key --populate cachyos
+          pacman -Sy --noconfirm
+
+      - name: Create Non-Root Builder User
+        run: |
+          useradd -m builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+          mkdir -p cachyos/out
+          chown -R builder:builder cachyos
+
+      - name: Import GPG Key for Builder
+        run: |
+          sudo -u builder gpg --batch --import <(echo "${{ secrets.GPG_PRIVATE_KEY }}")
+          echo "${{ secrets.GPG_KEY_ID }}:6:" | sudo -u builder gpg --import-ownertrust
+          sudo -u builder gpg --list-secret-keys --keyid-format=long
+
+      # ------------------------------------------------------------------
+      # PATCHES START HERE (Paths updated to 'cachyos/')
+      # ------------------------------------------------------------------
+      - name: Patch Package List
+        run: |
+          set -euo pipefail
+          PKG_LIST="cachyos/archiso/packages_desktop.x86_64"
+          cp "$PKG_LIST" "${PKG_LIST}.bak"
+
+          # ADD the Hyprland stack
+          for pkg in hyprland hyprpaper hyprlock hypridle hyprpolkitagent \
+              xdg-desktop-portal-hyprland xdg-desktop-portal-gtk \
+              waybar wofi mako grim slurp wl-clipboard \
+              qt5-wayland qt6-wayland greetd greetd-tuigreet \
+              bluez bluez-utils thunar network-manager-applet; do
+            if ! grep -qx "$pkg" "$PKG_LIST"; then
+              echo "$pkg" >> "$PKG_LIST"
+            fi
+          done
+
+          # REMOVE Plasma + installer + bloat + LTS kernel + ZFS
+          for pkg in cachyos-calamares-next cachyos-cli-installer-new \
+              cachyos-hello cachyos-kde-settings \
+              plasma-desktop plasma-workspace plasma-nm plasma-pa \
+              plasma-integration plasma-thunderbolt plasma-login-manager \
+              kde-gtk-config kinfocenter kscreen bluedevil breeze-gtk \
+              polkit-kde-agent dolphin konsole kate kcalc spectacle \
+              partitionmanager kxkb2locale1 \
+              gparted gpart clonezilla partclone partimage testdisk \
+              ddrescue fatresize cloud-init open-vm-tools qemu-guest-agent \
+              virtualbox-guest-utils spice-vdagent hyperv \
+              darkhttpd bind dnsmasq lftp lynx irssi nmap tcpdump \
+              traceroute ndisc6 inetutils lsof mc smartmontools nvme-cli \
+              sdparm sg3_utils lsscsi dmidecode hwinfo usbmuxd wvdial \
+              gcc fakeroot paru edk2-shell memtest86+ memtest86+-efi \
+              refind syslinux squashfs-tools os-prober ntp avahi nss-mdns \
+              bolt pcsclite occt linux-atm wireless_tools net-tools \
+              imwheel libwnck3 xdg-user-dirs-gtk rxvt-unicode-terminfo \
+              inotify-tools ethtool cachyos-fish-config \
+              linux-firmware-marvell b43-fwcutter vim \
+              bcachefs-tools f2fs-tools jfsutils nilfs-utils dmraid \
+              noto-fonts-cjk opendesktop-fonts openvpn vpnc rp-pppoe xl2tpd \
+              modemmanager mobile-broadband-provider-info usb_modeswitch \
+              linux-cachyos-lts linux-cachyos-lts-zfs linux-cachyos-lts-nvidia-open \
+              linux-cachyos-zfs zfs-utils; do
+            if grep -qx "$pkg" "$PKG_LIST"; then
+              sed -i "/^${pkg}$/d" "$PKG_LIST"
+            fi
+          done
+
+          # GUARD
+          missing=0
+          for pkg in hyprland pipewire pipewire-pulse wireplumber networkmanager \
+              wpa_supplicant mkinitcpio mkinitcpio-archiso linux-cachyos \
+              linux-cachyos-nvidia-open nvidia-utils mesa \
+              xdg-desktop-portal-hyprland hyprpolkitagent bluez bluez-utils \
+              firefox alacritty thunar nano grim slurp greetd greetd-tuigreet \
+              sof-firmware linux-firmware grub efibootmgr chwd polkit \
+              cryptsetup lvm2 btrfs-progs e2fsprogs efibootmgr; do
+            if ! grep -qx "$pkg" "$PKG_LIST"; then
+              echo "GUARD FAIL: '$pkg' missing" >&2
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then exit 1; fi
+
+      - name: Patch util-iso.sh
+        run: |
+          sed -i 's|/usr/lib/systemd/system/plasmalogin\.service|/usr/lib/systemd/system/greetd.service|g' cachyos/util-iso.sh
+
+      - name: Patch linux.preset
+        run: |
+          PRESET="cachyos/archiso/airootfs/etc/mkinitcpio.d/linux.preset"
+          sed -i 's|linux-cachyos-lts|linux-cachyos|g' "$PRESET"
+
+      - name: Patch airootfs
+        run: |
+          AIROOT="cachyos/archiso/airootfs"
+          rm -f  "$AIROOT/etc/plasmalogin.conf"
+          rm -rf "$AIROOT/etc/plasmalogin.conf.d"
+          rm -f  "$AIROOT/etc/pacman.d/hooks/90-cachyos-live-kwin-keyboard.hook"
+          rm -f  "$AIROOT/etc/modules-load.d/zfs.conf"
+          rm -f  "$AIROOT/etc/modprobe.d/broadcom-wl.conf"
+          rm -f  "$AIROOT/etc/skel/.config/kded5rc"
+          rm -f  "$AIROOT/etc/skel/.config/kscreenlockerrc"
+          rm -f  "$AIROOT/etc/skel/.config/kwalletrc"
+          rm -f  "$AIROOT/etc/skel/.config/plasma-welcomerc"
+          rm -f  "$AIROOT/etc/skel/.config/powerdevilrc"
+          rm -f  "$AIROOT/etc/skel/.config/powermanagementprofilesrc"
+          rm -rf "$AIROOT/etc/skel/.config/systemd/user/plasma-login-kwin_wayland.service.d"
+
+          mkdir -p "$AIROOT/etc/greetd"
+          cat > "$AIROOT/etc/greetd/config.toml" <<'GREETD'
+          [terminal]
+          vt = 1
+          [default_session]
+          command = "tuigreet --time --remember --cmd Hyprland"
+          user = "greeter"
+          GREETD
+
+          mkdir -p "$AIROOT/etc/skel/.config/hypr"
+          cat > "$AIROOT/etc/skel/.config/hypr/hyprland.conf" <<'HYPR'
+          monitor=,preferred,auto,auto
+          exec-once = waybar & mako
+          $mod = SUPER
+          bind = $mod, RETURN, exec, alacritty
+          bind = $mod, Q, killactive
+          bind = $mod, D, exec, wofi --show drun
+          bind = $mod, E, exec, thunar
+          HYPR
+
+      - name: Patch Boot Entries
+        run: |
+          sed -i 's|linux-cachyos-lts|linux-cachyos|g' cachyos/archiso/grub/grub.cfg
+          sed -i '/^menuentry "CachyOS LTS Kernel"/,/^}/ s/^/# /' cachyos/archiso/grub/grub.cfg
+          
+          EFI_DIR="cachyos/archiso/efiboot/loader/entries"
+          rm -f "$EFI_DIR/01-archiso-linux.conf"
+          rm -f "$EFI_DIR/03-archiso-memtest86+.conf"
+          sed -i 's|linux-cachyos-lts|linux-cachyos|g' "$EFI_DIR/fallback.conf"
+          sed -i 's|^default .*|default 02-archiso-linux-cachyos.conf|' cachyos/archiso/efiboot/loader/loader.conf
+      # ------------------------------------------------------------------
+      # PATCHES END HERE
+      # ------------------------------------------------------------------
+
+      - name: Build the ISO
+        run: |
+          set -uo pipefail
+          cd cachyos
+          chmod +x ./buildiso.sh
+          sudo chown -R builder:builder /var/cache/pacman/pkg
+          
+          rm -rf build/ work/ out/*
+
+          set +e
+          sudo -H -E -u builder ./buildiso.sh -p desktop -v -w -g "${{ secrets.GPG_KEY_ID }}"
+          build_rc=$?
+          set -e
+          echo "buildiso.sh exit code: $build_rc"
+
+          if [ -d out ] && ls out/*/*.iso 1>/dev/null 2>&1; then
+            echo "ISO successfully compiled."
+            find out -name '*.iso' -o -name '*.sig' -exec ls -lh {} \;
+          else
+            echo "ISO file not found — build failed." >&2
+            exit 1
+          fi
+        working-directory: ${{ github.workspace }}
+
+      - name: Upload ISO and Signature as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cachyos-hyprland-iso
+          path: |
+            cachyos/out/**/*.iso
+            cachyos/out/**/*.sig
+            cachyos/out/**/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Release ISO
+        if: startsWith(github.ref, 'refs/tags/cachyos-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            cachyos/out/**/*.iso
+            cachyos/out/**/*.sig
+            cachyos/out/**/*.sha256
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
