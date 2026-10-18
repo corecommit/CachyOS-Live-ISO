@@ -46,18 +46,28 @@ jobs:
           chown -R builder:builder cachyos
 
       - name: Import GPG Key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
         run: |
-          echo "${{ secrets.GPG_PRIVATE_KEY }}" > /tmp/private.key
+          # 1. Write the key to a file using the env variable to prevent corruption
+          echo "$GPG_PRIVATE_KEY" > /tmp/private.key
           
-          # Import for root (needed by mkarchiso)
-          gpg --batch --import /tmp/private.key || true
-          echo "${{ secrets.GPG_KEY_ID }}:6:" | gpg --import-ownertrust || true
+          # 2. Import for ROOT (Required by mkarchiso)
+          gpg --batch --import /tmp/private.key
+          echo "$GPG_KEY_ID:6:" | gpg --import-ownertrust
           
-          # Import for builder
-          sudo -u builder gpg --batch --import /tmp/private.key || true
-          echo "${{ secrets.GPG_KEY_ID }}:6:" | sudo -u builder gpg --import-ownertrust || true
+          # 3. Import for BUILDER (Required by buildiso.sh post-processing)
+          sudo -u builder gpg --batch --import /tmp/private.key
+          echo "$GPG_KEY_ID:6:" | sudo -u builder gpg --import-ownertrust
           
           rm -f /tmp/private.key
+          
+          # 4. Verify it works and fail loudly if it doesn't
+          echo "--- Root Keyring ---"
+          gpg --list-secret-keys "$GPG_KEY_ID"
+          echo "--- Builder Keyring ---"
+          sudo -u builder gpg --list-secret-keys "$GPG_KEY_ID"
 
       # ------------------------------------------------------------------
       # PATCHES START HERE
@@ -80,8 +90,6 @@ jobs:
           done
 
           # REMOVE Plasma + installer + bloat + LTS kernel + ZFS
-          # NOTE: We intentionally KEEP syslinux, memtest86+, edk2-shell, squashfs-tools
-          # because mkarchiso validation expects them based on profiledef.sh
           for pkg in cachyos-calamares-next cachyos-cli-installer-new \
               cachyos-hello cachyos-kde-settings \
               plasma-desktop plasma-workspace plasma-nm plasma-pa \
@@ -127,12 +135,17 @@ jobs:
           if [ "$missing" -ne 0 ]; then exit 1; fi
 
       - name: Patch util-iso.sh
+        env:
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
         run: |
           # 1. Swap display manager
           sed -i 's|/usr/lib/systemd/system/plasmalogin\.service|/usr/lib/systemd/system/greetd.service|g' cachyos/util-iso.sh
           
-          # 2. Inject GPG key flag into mkarchiso call
-          sed -i 's|sudo mkarchiso -v -w ${work_dir} -o "$outFolder/$_profile" ${work_dir}/archiso/|sudo mkarchiso -v -w ${work_dir} -o "$outFolder/$_profile" -g "${{ secrets.GPG_KEY_ID }}" ${work_dir}/archiso/|g' cachyos/util-iso.sh
+          # 2. Inject GPG key ID into util-iso.sh global variable
+          sed -i "2i gpg_key=\"$GPG_KEY_ID\"" cachyos/util-iso.sh
+          
+          # 3. Inject the -g flag into the mkarchiso call
+          sed -i "s|sudo mkarchiso -v -w \${work_dir} -o \"\$outFolder/\$_profile\" \${work_dir}/archiso/|sudo mkarchiso -v -w \${work_dir} -o \"\$outFolder/\$_profile\" -g \"$GPG_KEY_ID\" \${work_dir}/archiso/|g" cachyos/util-iso.sh
 
       - name: Patch linux.preset
         run: |
@@ -199,6 +212,7 @@ jobs:
           rm -rf build/ work/ out/*
 
           set +e
+          # Removed -g flag from here because it's injected directly into util-iso.sh now
           sudo -H -E -u builder ./buildiso.sh -p desktop -v -w
           build_rc=$?
           set -e
