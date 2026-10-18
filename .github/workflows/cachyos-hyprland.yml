@@ -45,13 +45,19 @@ jobs:
           mkdir -p cachyos/out
           chown -R builder:builder cachyos
 
-      - name: Import GPG Key for Builder
+      - name: Import GPG Key
         run: |
           echo "${{ secrets.GPG_PRIVATE_KEY }}" > /tmp/private.key
+          
+          # Import for root (needed by mkarchiso)
+          gpg --batch --import /tmp/private.key || true
+          echo "${{ secrets.GPG_KEY_ID }}:6:" | gpg --import-ownertrust || true
+          
+          # Import for builder (needed by buildiso.sh post-processing)
           sudo -u builder gpg --batch --import /tmp/private.key || true
-          rm -f /tmp/private.key
           echo "${{ secrets.GPG_KEY_ID }}:6:" | sudo -u builder gpg --import-ownertrust || true
-          sudo -u builder gpg --list-secret-keys --keyid-format=long
+          
+          rm -f /tmp/private.key
 
       # ------------------------------------------------------------------
       # PATCHES START HERE
@@ -121,7 +127,11 @@ jobs:
 
       - name: Patch util-iso.sh
         run: |
+          # 1. Swap display manager
           sed -i 's|/usr/lib/systemd/system/plasmalogin\.service|/usr/lib/systemd/system/greetd.service|g' cachyos/util-iso.sh
+          
+          # 2. Inject GPG key flag into mkarchiso call
+          sed -i 's|sudo mkarchiso -v -w ${work_dir} -o "$outFolder/$_profile" ${work_dir}/archiso/|sudo mkarchiso -v -w ${work_dir} -o "$outFolder/$_profile" -g "${{ secrets.GPG_KEY_ID }}" ${work_dir}/archiso/|g' cachyos/util-iso.sh
 
       - name: Patch linux.preset
         run: |
@@ -188,7 +198,8 @@ jobs:
           rm -rf build/ work/ out/*
 
           set +e
-          sudo -H -E -u builder ./buildiso.sh -p desktop -v -w -g "${{ secrets.GPG_KEY_ID }}"
+          # Removed -g flag from this call
+          sudo -H -E -u builder ./buildiso.sh -p desktop -v -w
           build_rc=$?
           set -e
           echo "buildiso.sh exit code: $build_rc"
