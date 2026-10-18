@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     tags:
-      - 'cachyos-v*' # Tag releases like: cachyos-v1.0.0
+      - 'cachyos-v*'
 
 jobs:
   build-cachyos-hyprland:
@@ -27,12 +27,9 @@ jobs:
         run: |
           pacman-key --init
           pacman-key --populate archlinux
-          
           printf '\n[cachyos]\nSigLevel = Required DatabaseOptional\nServer = https://mirror.cachyos.org/repo/$arch/$repo\n' >> /etc/pacman.conf
-          
           pacman-key --recv-keys F3B607488DB35A47 --keyserver keyserver.ubuntu.com
           pacman-key --lsign-key F3B607488DB35A47
-          
           pacman -Sy --noconfirm
           pacman -S --noconfirm cachyos-keyring
           pacman-key --populate cachyos
@@ -50,24 +47,33 @@ jobs:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
           GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
         run: |
-          # 1. Write the key to a file using the env variable to prevent corruption
-          echo "$GPG_PRIVATE_KEY" > /tmp/private.key
-          
-          # 2. Import for ROOT (Required by mkarchiso)
-          gpg --batch --import /tmp/private.key
-          echo "$GPG_KEY_ID:6:" | gpg --import-ownertrust
-          
-          # 3. Import for BUILDER (Required by buildiso.sh post-processing)
-          sudo -u builder gpg --batch --import /tmp/private.key
-          echo "$GPG_KEY_ID:6:" | sudo -u builder gpg --import-ownertrust
-          
+          # 1. Write key safely using a heredoc to prevent GitHub masking corruption
+          cat << 'EOF' > /tmp/private.key
+          $GPG_PRIVATE_KEY
+          EOF
+
+          # 2. Import into ROOT keyring specifically
+          export GNUPGHOME=/root/.gnupg
+          mkdir -p "$GNUPGHOME"
+          chmod 700 "$GNUPGHOME"
+          gpg --batch --import /tmp/private.key || true
+          echo "$GPG_KEY_ID:6:" | gpg --import-ownertrust || true
+
+          # 3. Import into BUILDER keyring
+          export GNUPGHOME=/home/builder/.gnupg
+          mkdir -p "$GNUPGHOME"
+          chown builder:builder "$GNUPGHOME"
+          chmod 700 "$GNUPGHOME"
+          sudo -u builder gpg --batch --import /tmp/private.key || true
+          echo "$GPG_KEY_ID:6:" | sudo -u builder gpg --import-ownertrust || true
+
           rm -f /tmp/private.key
-          
-          # 4. Verify it works and fail loudly if it doesn't
+
+          # 4. Verify the key is actually there (This will fail the build if it's missing)
           echo "--- Root Keyring ---"
-          gpg --list-secret-keys "$GPG_KEY_ID"
+          GNUPGHOME=/root/.gnupg gpg --list-secret-keys "$GPG_KEY_ID" || { echo "Root key missing!"; exit 1; }
           echo "--- Builder Keyring ---"
-          sudo -u builder gpg --list-secret-keys "$GPG_KEY_ID"
+          GNUPGHOME=/home/builder/.gnupg gpg --list-secret-keys "$GPG_KEY_ID" || { echo "Builder key missing!"; exit 1; }
 
       # ------------------------------------------------------------------
       # PATCHES START HERE
@@ -78,7 +84,6 @@ jobs:
           PKG_LIST="cachyos/archiso/packages_desktop.x86_64"
           cp "$PKG_LIST" "${PKG_LIST}.bak"
 
-          # ADD the Hyprland stack
           for pkg in hyprland hyprpaper hyprlock hypridle hyprpolkitagent \
               xdg-desktop-portal-hyprland xdg-desktop-portal-gtk \
               waybar wofi mako grim slurp wl-clipboard \
@@ -89,7 +94,6 @@ jobs:
             fi
           done
 
-          # REMOVE Plasma + installer + bloat + LTS kernel + ZFS
           for pkg in cachyos-calamares-next cachyos-cli-installer-new \
               cachyos-hello cachyos-kde-settings \
               plasma-desktop plasma-workspace plasma-nm plasma-pa \
@@ -118,7 +122,6 @@ jobs:
             fi
           done
 
-          # GUARD: Fail if any critical package is missing
           missing=0
           for pkg in hyprland pipewire pipewire-pulse wireplumber networkmanager \
               wpa_supplicant mkinitcpio mkinitcpio-archiso linux-cachyos \
@@ -138,13 +141,10 @@ jobs:
         env:
           GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
         run: |
-          # 1. Swap display manager
+          # Swap display manager
           sed -i 's|/usr/lib/systemd/system/plasmalogin\.service|/usr/lib/systemd/system/greetd.service|g' cachyos/util-iso.sh
           
-          # 2. Inject GPG key ID into util-iso.sh global variable
-          sed -i "2i gpg_key=\"$GPG_KEY_ID\"" cachyos/util-iso.sh
-          
-          # 3. Inject the -g flag into the mkarchiso call
+          # Inject the -g flag into the mkarchiso call
           sed -i "s|sudo mkarchiso -v -w \${work_dir} -o \"\$outFolder/\$_profile\" \${work_dir}/archiso/|sudo mkarchiso -v -w \${work_dir} -o \"\$outFolder/\$_profile\" -g \"$GPG_KEY_ID\" \${work_dir}/archiso/|g" cachyos/util-iso.sh
 
       - name: Patch linux.preset
@@ -212,7 +212,6 @@ jobs:
           rm -rf build/ work/ out/*
 
           set +e
-          # Removed -g flag from here because it's injected directly into util-iso.sh now
           sudo -H -E -u builder ./buildiso.sh -p desktop -v -w
           build_rc=$?
           set -e
