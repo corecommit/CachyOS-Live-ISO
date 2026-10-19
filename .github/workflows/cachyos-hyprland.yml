@@ -2,38 +2,109 @@ name: Build CachyOS Hyprland ISO
 
 on:
   workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "CachyOS-Live-ISO commit SHA/branch/tag (empty = UPSTREAM_PIN below, else default branch)"
+        required: false
+        default: ""
+      keep_installer:
+        description: "Keep the CachyOS installer(s) in the ISO"
+        type: boolean
+        default: true
   push:
     tags:
       - 'cachyos-v*'
 
+env:
+  # Paste a commit SHA from CachyOS/CachyOS-Live-ISO here to pin the upstream.
+  # Empty = default branch. The clone step logs the SHA it used, so copy it
+  # from a good run's log into this line.
+  UPSTREAM_PIN: ""
+
 jobs:
   build-cachyos-hyprland:
     runs-on: ubuntu-latest
+    timeout-minutes: 240
+    permissions:
+      contents: write   # needed by the release step
     container:
       image: archlinux:base-devel
-      options: --privileged
+      # The -v mounts expose big preinstalled host toolchains so the
+      # "Free host disk space" step can delete them.
+      options: >-
+        --privileged
+        -v /usr/local/lib/android:/host/android
+        -v /usr/share/dotnet:/host/dotnet
 
     steps:
+      - name: Free host disk space
+        run: |
+          for d in /host/android /host/dotnet; do
+            if [ -d "$d" ]; then rm -rf "${d:?}"/* || true; fi
+          done
+          df -h /
+          avail=$(df --output=avail -BG / | tail -n1 | tr -dc '0-9')
+          if [ "${avail:-0}" -lt 25 ]; then
+            echo "::warning::Only ${avail}G free; the build may run out of disk."
+          fi
+
       - name: Install Base Build Dependencies
         run: |
-          pacman -Sy --noconfirm archiso mkinitcpio-archiso git squashfs-tools grub syslinux
+          pacman -Syu --noconfirm archiso mkinitcpio-archiso git squashfs-tools grub syslinux
+
+      - name: Install patch helper
+        run: |
+          # sedx [-o] FILE SED_EXPR : like `sed -i`, but FAILS if nothing changed
+          # (-o = only warn). Stops silent no-op patches when upstream drifts.
+          cat > /usr/local/bin/sedx <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          opt=0
+          if [ "${1:-}" = "-o" ]; then opt=1; shift; fi
+          f="$1"; e="$2"
+          if [ ! -f "$f" ]; then echo "PATCH FAIL: missing file: $f" >&2; exit 1; fi
+          before=$(sha256sum "$f" | cut -d' ' -f1)
+          sed -i -e "$e" "$f"
+          after=$(sha256sum "$f" | cut -d' ' -f1)
+          if [ "$before" = "$after" ]; then
+            if [ "$opt" = 1 ]; then echo "::warning::sedx: no change from '$e' in $f"; exit 0; fi
+            echo "PATCH FAIL: '$e' changed nothing in $f" >&2
+            exit 1
+          fi
+          SH
+          chmod +x /usr/local/bin/sedx
 
       - name: Clone Upstream CachyOS Repo
+        env:
+          UPSTREAM_REF: ${{ inputs.upstream_ref || env.UPSTREAM_PIN }}
         run: |
+          set -euo pipefail
           rm -rf cachyos
-          git clone --depth 1 https://github.com/CachyOS/CachyOS-Live-ISO.git cachyos
+          if [ -n "$UPSTREAM_REF" ]; then
+            git init -q cachyos
+            git -C cachyos remote add origin https://github.com/CachyOS/CachyOS-Live-ISO.git
+            git -C cachyos fetch --depth 1 origin "$UPSTREAM_REF"
+            git -C cachyos checkout -q FETCH_HEAD
+          else
+            git clone --depth 1 https://github.com/CachyOS/CachyOS-Live-ISO.git cachyos
+            echo "::notice::Upstream is NOT pinned. Set UPSTREAM_PIN to the SHA below to pin it."
+          fi
+          sha=$(git -c safe.directory='*' -C cachyos rev-parse HEAD)
+          echo "Upstream CachyOS-Live-ISO commit: $sha"
+          echo "Upstream commit: \`$sha\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Initialize CachyOS Keyring and Repositories
         run: |
+          set -euo pipefail
           pacman-key --init
           pacman-key --populate archlinux
           printf '\n[cachyos]\nSigLevel = Required DatabaseOptional\nServer = https://mirror.cachyos.org/repo/$arch/$repo\n' >> /etc/pacman.conf
           pacman-key --recv-keys F3B607488DB35A47 --keyserver keyserver.ubuntu.com
           pacman-key --lsign-key F3B607488DB35A47
-          pacman -Sy --noconfirm
+          pacman -Syu --noconfirm
           pacman -S --noconfirm cachyos-keyring
           pacman-key --populate cachyos
-          pacman -Sy --noconfirm
+          pacman -Syu --noconfirm
 
       - name: Create Non-Root Builder User
         run: |
@@ -46,46 +117,60 @@ jobs:
       # PATCHES START HERE
       # ------------------------------------------------------------------
       - name: Patch Package List
+        env:
+          KEEP_INSTALLER: ${{ github.event_name != 'workflow_dispatch' || inputs.keep_installer }}
         run: |
           set -euo pipefail
           PKG_LIST="cachyos/archiso/packages_desktop.x86_64"
-          cp "$PKG_LIST" "${PKG_LIST}.bak"
+          [ -f "$PKG_LIST" ] || { echo "PATCH FAIL: $PKG_LIST not found" >&2; exit 1; }
 
-          for pkg in hyprland hyprpaper hyprlock hypridle hyprpolkitagent \
-              xdg-desktop-portal-hyprland xdg-desktop-portal-gtk \
-              waybar wofi mako grim slurp wl-clipboard \
-              qt5-wayland qt6-wayland greetd greetd-tuigreet \
-              bluez bluez-utils thunar network-manager-applet; do
-            if ! grep -qx "$pkg" "$PKG_LIST"; then
+          ADD=(
+            hyprland hyprpaper hyprlock hypridle hyprpolkitagent
+            xdg-desktop-portal-hyprland xdg-desktop-portal-gtk
+            waybar wofi mako grim slurp wl-clipboard
+            qt5-wayland qt6-wayland greetd greetd-tuigreet
+            bluez bluez-utils thunar network-manager-applet
+            swaybg brightnessctl otf-font-awesome
+            alacritty firefox nano
+          )
+
+          REMOVE=(
+            cachyos-hello cachyos-kde-settings
+            plasma-desktop plasma-workspace plasma-nm plasma-pa
+            plasma-integration plasma-thunderbolt plasma-login-manager
+            kde-gtk-config kinfocenter kscreen bluedevil breeze-gtk
+            polkit-kde-agent dolphin konsole kate kcalc spectacle
+            partitionmanager kxkb2locale1
+            gparted gpart clonezilla partclone partimage testdisk
+            ddrescue fatresize cloud-init open-vm-tools qemu-guest-agent
+            virtualbox-guest-utils spice-vdagent hyperv
+            darkhttpd bind dnsmasq lftp lynx irssi nmap tcpdump
+            traceroute ndisc6 inetutils lsof mc smartmontools nvme-cli
+            sdparm sg3_utils lsscsi dmidecode hwinfo usbmuxd wvdial
+            gcc fakeroot paru refind os-prober ntp avahi nss-mdns
+            bolt pcsclite occt linux-atm wireless_tools net-tools
+            imwheel libwnck3 xdg-user-dirs-gtk rxvt-unicode-terminfo
+            inotify-tools ethtool cachyos-fish-config
+            linux-firmware-marvell b43-fwcutter vim
+            bcachefs-tools f2fs-tools jfsutils nilfs-utils dmraid
+            noto-fonts-cjk opendesktop-fonts openvpn vpnc rp-pppoe xl2tpd
+            modemmanager mobile-broadband-provider-info usb_modeswitch
+            linux-cachyos-lts linux-cachyos-lts-zfs linux-cachyos-lts-nvidia-open
+            linux-cachyos-zfs zfs-utils
+          )
+          if [ "$KEEP_INSTALLER" != "true" ]; then
+            REMOVE+=( cachyos-calamares-next cachyos-cli-installer-new )
+          fi
+          echo "KEEP_INSTALLER=$KEEP_INSTALLER"
+
+          # Remove first, then add, so a package in both lists ends up present.
+          printf '%s\n' "${REMOVE[@]}" > /tmp/remove.txt
+          grep -vxFf /tmp/remove.txt "$PKG_LIST" > /tmp/pkgs.new || true
+          cp /tmp/pkgs.new "$PKG_LIST"
+
+          for pkg in "${ADD[@]}"; do
+            if ! grep -qxF "$pkg" "$PKG_LIST"; then
               echo "$pkg" >> "$PKG_LIST"
-            fi
-          done
-
-          for pkg in cachyos-calamares-next cachyos-cli-installer-new \
-              cachyos-hello cachyos-kde-settings \
-              plasma-desktop plasma-workspace plasma-nm plasma-pa \
-              plasma-integration plasma-thunderbolt plasma-login-manager \
-              kde-gtk-config kinfocenter kscreen bluedevil breeze-gtk \
-              polkit-kde-agent dolphin konsole kate kcalc spectacle \
-              partitionmanager kxkb2locale1 \
-              gparted gpart clonezilla partclone partimage testdisk \
-              ddrescue fatresize cloud-init open-vm-tools qemu-guest-agent \
-              virtualbox-guest-utils spice-vdagent hyperv \
-              darkhttpd bind dnsmasq lftp lynx irssi nmap tcpdump \
-              traceroute ndisc6 inetutils lsof mc smartmontools nvme-cli \
-              sdparm sg3_utils lsscsi dmidecode hwinfo usbmuxd wvdial \
-              gcc fakeroot paru refind os-prober ntp avahi nss-mdns \
-              bolt pcsclite occt linux-atm wireless_tools net-tools \
-              imwheel libwnck3 xdg-user-dirs-gtk rxvt-unicode-terminfo \
-              inotify-tools ethtool cachyos-fish-config \
-              linux-firmware-marvell b43-fwcutter vim \
-              bcachefs-tools f2fs-tools jfsutils nilfs-utils dmraid \
-              noto-fonts-cjk opendesktop-fonts openvpn vpnc rp-pppoe xl2tpd \
-              modemmanager mobile-broadband-provider-info usb_modeswitch \
-              linux-cachyos-lts linux-cachyos-lts-zfs linux-cachyos-lts-nvidia-open \
-              linux-cachyos-zfs zfs-utils; do
-            if grep -qx "$pkg" "$PKG_LIST"; then
-              sed -i "/^${pkg}$/d" "$PKG_LIST"
             fi
           done
 
@@ -96,9 +181,9 @@ jobs:
               xdg-desktop-portal-hyprland hyprpolkitagent bluez bluez-utils \
               firefox alacritty thunar nano grim slurp greetd greetd-tuigreet \
               sof-firmware linux-firmware grub efibootmgr chwd polkit \
-              cryptsetup lvm2 btrfs-progs e2fsprogs efibootmgr syslinux; do
-            if ! grep -qx "$pkg" "$PKG_LIST"; then
-              echo "GUARD FAIL: '$pkg' missing" >&2
+              cryptsetup lvm2 btrfs-progs e2fsprogs syslinux; do
+            if ! grep -qxF "$pkg" "$PKG_LIST"; then
+              echo "GUARD FAIL: '$pkg' missing from package list" >&2
               missing=1
             fi
           done
@@ -106,20 +191,33 @@ jobs:
 
       - name: Patch util-iso.sh
         run: |
-          # 1. Swap display manager
-          sed -i 's|/usr/lib/systemd/system/plasmalogin\.service|/usr/lib/systemd/system/greetd.service|g' cachyos/util-iso.sh
-          
-          # 2. Replace the signing command with `true` so it does nothing but keeps the `if` block valid
-          sed -i 's|sign_with_key \$f|true|g' cachyos/util-iso.sh
+          set -euo pipefail
+          UTIL=cachyos/util-iso.sh
+          # 1. Swap display manager service
+          sedx "$UTIL" 's|/usr/lib/systemd/system/plasmalogin\.service|/usr/lib/systemd/system/greetd.service|g'
+          # 2. Replace the signing command with `true` (no signing key in CI)
+          sedx "$UTIL" 's|sign_with_key \$f|true|g'
 
       - name: Patch linux.preset
         run: |
-          PRESET="cachyos/archiso/airootfs/etc/mkinitcpio.d/linux.preset"
-          sed -i 's|linux-cachyos-lts|linux-cachyos|g' "$PRESET"
+          set -euo pipefail
+          sedx cachyos/archiso/airootfs/etc/mkinitcpio.d/linux.preset 's|linux-cachyos-lts|linux-cachyos|g'
 
       - name: Patch airootfs
         run: |
+          set -euo pipefail
           AIROOT="cachyos/archiso/airootfs"
+
+          # Find the live user from the Plasma login config BEFORE deleting it.
+          LIVE_USER=$(grep -rhoP '^\s*User=\K\S+' \
+            "$AIROOT/etc/plasmalogin.conf" "$AIROOT/etc/plasmalogin.conf.d" 2>/dev/null \
+            | head -n1 || true)
+          LIVE_USER=${LIVE_USER:-liveuser}
+          echo "Live user for autologin: $LIVE_USER"
+          if [ -f "$AIROOT/etc/passwd" ] && ! grep -q "^${LIVE_USER}:" "$AIROOT/etc/passwd"; then
+            echo "::warning::User '$LIVE_USER' not found in airootfs/etc/passwd; autologin may fail."
+          fi
+
           rm -f  "$AIROOT/etc/plasmalogin.conf"
           rm -rf "$AIROOT/etc/plasmalogin.conf.d"
           rm -f  "$AIROOT/etc/pacman.d/hooks/90-cachyos-live-kwin-keyboard.hook"
@@ -133,36 +231,133 @@ jobs:
           rm -f  "$AIROOT/etc/skel/.config/powermanagementprofilesrc"
           rm -rf "$AIROOT/etc/skel/.config/systemd/user/plasma-login-kwin_wayland.service.d"
 
+          # Session launcher: prefer start-hyprland (newer Hyprland), else the bare binary.
+          # Run via `sh <file>` so it needs no executable bit (archiso doesn't keep modes).
           mkdir -p "$AIROOT/etc/greetd"
+          cat > "$AIROOT/etc/greetd/hypr-session.sh" <<'SESSION'
+          #!/bin/sh
+          if command -v start-hyprland >/dev/null 2>&1; then
+            exec start-hyprland
+          fi
+          exec Hyprland
+          SESSION
+
           cat > "$AIROOT/etc/greetd/config.toml" <<'GREETD'
           [terminal]
           vt = 1
+
+          [initial_session]
+          command = "sh /etc/greetd/hypr-session.sh"
+          user = "@LIVE_USER@"
+
           [default_session]
-          command = "tuigreet --time --remember --cmd Hyprland"
+          command = 'tuigreet --time --remember --cmd "sh /etc/greetd/hypr-session.sh"'
           user = "greeter"
           GREETD
+          sed -i "s/@LIVE_USER@/${LIVE_USER}/" "$AIROOT/etc/greetd/config.toml"
 
-          mkdir -p "$AIROOT/etc/skel/.config/hypr"
-          cat > "$AIROOT/etc/skel/.config/hypr/hyprland.conf" <<'HYPR'
+          HYPRCONF="$AIROOT/etc/skel/.config/hypr/hyprland.conf"
+          mkdir -p "$(dirname "$HYPRCONF")"
+          cat > "$HYPRCONF" <<'HYPR'
           monitor=,preferred,auto,auto
-          exec-once = waybar & mako
+
           $mod = SUPER
-          bind = $mod, RETURN, exec, alacritty
+          $term = alacritty
+          $files = thunar
+          $menu = wofi --show drun
+
+          # Autostart
+          exec-once = systemctl --user start hyprpolkitagent
+          exec-once = swaybg -c 1e1e2e
+          exec-once = waybar
+          exec-once = mako
+          exec-once = nm-applet --indicator
+
+          # Apps and session
+          bind = $mod, RETURN, exec, $term
+          bind = $mod, D, exec, $menu
+          bind = $mod, E, exec, $files
+          bind = $mod, B, exec, firefox
+          bind = $mod, F1, exec, alacritty -e less ~/.config/hypr/hyprland.conf
           bind = $mod, Q, killactive
-          bind = $mod, D, exec, wofi --show drun
-          bind = $mod, E, exec, thunar
+          bind = $mod SHIFT, E, exit
+
+          # Window management
+          bind = $mod, V, togglefloating
+          bind = $mod, F, fullscreen
+          bind = $mod, left, movefocus, l
+          bind = $mod, right, movefocus, r
+          bind = $mod, up, movefocus, u
+          bind = $mod, down, movefocus, d
+          bindm = $mod, mouse:272, movewindow
+          bindm = $mod, mouse:273, resizewindow
+
+          # Screenshot to clipboard
+          bind = , Print, exec, grim -g "$(slurp)" - | wl-copy
+
+          # Media keys
+          bindel = , XF86AudioRaiseVolume, exec, wpctl set-volume -l 1 @DEFAULT_AUDIO_SINK@ 5%+
+          bindel = , XF86AudioLowerVolume, exec, wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-
+          bindl  = , XF86AudioMute, exec, wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
+          bindel = , XF86MonBrightnessUp, exec, brightnessctl set 5%+
+          bindel = , XF86MonBrightnessDown, exec, brightnessctl set 5%-
+
+          # Workspaces 1-9
           HYPR
+          for i in 1 2 3 4 5 6 7 8 9; do
+            printf 'bind = $mod, %s, workspace, %s\n' "$i" "$i"
+            printf 'bind = $mod SHIFT, %s, movetoworkspace, %s\n' "$i" "$i"
+          done >> "$HYPRCONF"
 
       - name: Patch Boot Entries
         run: |
-          sed -i 's|linux-cachyos-lts|linux-cachyos|g' cachyos/archiso/grub/grub.cfg
-          sed -i '/^menuentry "CachyOS LTS Kernel"/,/^}/ s/^/# /' cachyos/archiso/grub/grub.cfg
-          
-          EFI_DIR="cachyos/archiso/efiboot/loader/entries"
+          set -euo pipefail
+          GRUB=cachyos/archiso/grub/grub.cfg
+          sedx "$GRUB" 's|linux-cachyos-lts|linux-cachyos|g'
+          sedx "$GRUB" '/^menuentry "CachyOS LTS Kernel"/,/^}/ s/^/# /'
+
+          EFI_DIR=cachyos/archiso/efiboot/loader/entries
+          DEFAULT_ENTRY=02-archiso-linux-cachyos.conf
           rm -f "$EFI_DIR/01-archiso-linux.conf"
           rm -f "$EFI_DIR/03-archiso-memtest86+.conf"
-          sed -i 's|linux-cachyos-lts|linux-cachyos|g' "$EFI_DIR/fallback.conf"
-          sed -i 's|^default .*|default 02-archiso-linux-cachyos.conf|' cachyos/archiso/efiboot/loader/loader.conf
+          sedx -o "$EFI_DIR/fallback.conf" 's|linux-cachyos-lts|linux-cachyos|g'
+
+          if [ ! -f "$EFI_DIR/$DEFAULT_ENTRY" ]; then
+            echo "PATCH FAIL: boot entry $DEFAULT_ENTRY not found. Entries present:" >&2
+            ls -1 "$EFI_DIR" >&2
+            exit 1
+          fi
+          sedx -o cachyos/archiso/efiboot/loader/loader.conf "s|^default .*|default ${DEFAULT_ENTRY}|"
+
+      - name: Verify patched profile
+        run: |
+          set -euo pipefail
+          fail=0
+          PKG_LIST=cachyos/archiso/packages_desktop.x86_64
+
+          for pkg in plasma-desktop plasma-login-manager linux-cachyos-lts; do
+            if grep -qxF "$pkg" "$PKG_LIST"; then echo "VERIFY FAIL: $pkg still in package list" >&2; fail=1; fi
+          done
+          if grep -q 'plasmalogin\.service' cachyos/util-iso.sh; then
+            echo "VERIFY FAIL: plasmalogin.service still referenced in util-iso.sh" >&2; fail=1
+          fi
+          if ! grep -q 'greetd\.service' cachyos/util-iso.sh; then
+            echo "VERIFY FAIL: greetd.service not referenced in util-iso.sh" >&2; fail=1
+          fi
+          if grep -qF 'sign_with_key $f' cachyos/util-iso.sh; then
+            echo "VERIFY FAIL: signing call still present in util-iso.sh" >&2; fail=1
+          fi
+          for f in etc/greetd/config.toml etc/greetd/hypr-session.sh etc/skel/.config/hypr/hyprland.conf; do
+            [ -s "cachyos/archiso/airootfs/$f" ] || { echo "VERIFY FAIL: missing/empty airootfs/$f" >&2; fail=1; }
+          done
+          [ "$fail" -eq 0 ] || exit 1
+
+          echo "--- Leftover KDE/Plasma/SDDM references in airootfs (review, non-fatal) ---"
+          grep -rIil 'plasma\|kwin\|sddm' cachyos/archiso/airootfs || echo "none"
+
+          echo "--- Patch summary ---"
+          git -c safe.directory='*' -C cachyos diff --stat || true
+          chown -R builder:builder cachyos
       # ------------------------------------------------------------------
       # PATCHES END HERE
       # ------------------------------------------------------------------
@@ -173,7 +368,7 @@ jobs:
           cd cachyos
           chmod +x ./buildiso.sh
           sudo chown -R builder:builder /var/cache/pacman/pkg
-          
+
           rm -rf build/ work/ out/*
 
           set +e
@@ -182,14 +377,35 @@ jobs:
           set -e
           echo "buildiso.sh exit code: $build_rc"
 
-          if [ -d out ] && ls out/*/*.iso 1>/dev/null 2>&1; then
+          if ls out/*/*.iso 1>/dev/null 2>&1; then
             echo "ISO successfully compiled."
+            if [ "$build_rc" -ne 0 ]; then
+              echo "::warning::buildiso.sh exited $build_rc but produced an ISO; check the log."
+            fi
             find out -name '*.iso' -exec ls -lh {} \;
           else
             echo "ISO file not found — build failed." >&2
             exit 1
           fi
         working-directory: ${{ github.workspace }}
+
+      - name: Check ISO size against release limit
+        id: size
+        run: |
+          set -euo pipefail
+          limit=$((2 * 1024 * 1024 * 1024))   # GitHub release assets must be < 2 GiB
+          ok=true
+          while IFS= read -r iso; do
+            size=$(stat -c %s "$iso")
+            echo "$iso: $((size / 1024 / 1024)) MiB"
+            if [ "$size" -ge "$limit" ]; then ok=false; fi
+          done < <(find cachyos/out -name '*.iso')
+          echo "release_ok=$ok" >> "$GITHUB_OUTPUT"
+          if [ "$ok" = false ]; then
+            msg="ISO is 2 GiB or larger: GitHub Releases will reject it, so the release step is skipped. The workflow artifact is still uploaded."
+            echo "::warning::$msg"
+            echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload ISO as Artifact
         uses: actions/upload-artifact@v4
@@ -202,7 +418,7 @@ jobs:
           retention-days: 30
 
       - name: Release ISO
-        if: startsWith(github.ref, 'refs/tags/cachyos-v')
+        if: startsWith(github.ref, 'refs/tags/cachyos-v') && steps.size.outputs.release_ok == 'true'
         uses: softprops/action-gh-release@v2
         with:
           files: |
