@@ -337,8 +337,12 @@ jobs:
             ls -1 cachyos/archiso >&2
             exit 1
           fi
-          # Drop whole LABEL stanzas that boot the LTS kernel (no dead menu entries).
+          # For each config that mentions the LTS kernel:
+          #  - if a plain linux-cachyos entry also exists, drop the LTS LABEL stanzas;
+          #  - if NOT (the BIOS menu may only have LTS entries), repoint them to
+          #    linux-cachyos instead, so the menu is never left without a bootable entry.
           for f in "$SYSLINUX"/*.cfg; do
+            grep -q 'linux-cachyos-lts' "$f" || continue
             awk '
               function flush() { if (buf != "" && buf !~ /linux-cachyos-lts/) printf "%s", buf; buf = "" }
               tolower($0) ~ /^[ \t]*label[ \t]/ { flush(); buf = $0 ORS; next }
@@ -346,8 +350,18 @@ jobs:
               { print }
               END { flush() }
             ' "$f" > "$f.new"
-            mv "$f.new" "$f"
+            if grep -qE 'vmlinuz-linux-cachyos([^-]|$)' "$f.new"; then
+              mv "$f.new" "$f"
+              echo "syslinux: removed LTS entries from $f"
+            else
+              rm -f "$f.new"
+              sed -i 's|linux-cachyos-lts|linux-cachyos|g' "$f"
+              echo "syslinux: no plain entry in $f; repointed LTS entries to linux-cachyos"
+            fi
           done
+          echo "::group::syslinux configs after patch"
+          for f in "$SYSLINUX"/*.cfg; do echo "=== $f"; cat "$f"; done
+          echo "::endgroup::"
 
           # --- Catch-all ---
           # Anything under archiso/ that still names the LTS kernel gets rewritten,
@@ -383,7 +397,10 @@ jobs:
             echo "VERIFY FAIL: LTS kernel still referenced under archiso/ (lines above)" >&2; fail=1
           fi
           if ! grep -rqE 'vmlinuz-linux-cachyos([^-]|$)' cachyos/archiso/syslinux; then
-            echo "VERIFY FAIL: no syslinux entry boots vmlinuz-linux-cachyos" >&2; fail=1
+            echo "VERIFY FAIL: no syslinux entry boots vmlinuz-linux-cachyos. Syslinux label/kernel lines:" >&2
+            ls -1 cachyos/archiso/syslinux >&2 || true
+            grep -rniE '^[[:space:]]*(label|linux|kernel|initrd)' cachyos/archiso/syslinux >&2 || true
+            fail=1
           fi
           [ "$fail" -eq 0 ] || exit 1
 
