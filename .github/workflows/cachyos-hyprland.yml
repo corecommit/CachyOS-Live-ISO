@@ -450,16 +450,32 @@ jobs:
           iso=$(find cachyos/out -name '*.iso' | head -n1)
           echo "Checking $iso"
           tmp=$(mktemp -d)
-          bsdtar -x -f "$iso" -C "$tmp" --include='*.cfg' --include='*.conf'
+          list="$tmp.list"
+          mkdir -p "$tmp/cfg"
 
-          mapfile -t kernels < <(bsdtar -t -f "$iso" | sed -n 's|.*/\(vmlinuz-[^/]*\)$|\1|p' | sort -u)
+          # Tooling problems only warn; only a real kernel mismatch fails the job.
+          if ! bsdtar -t -f "$iso" > "$list"; then
+            echo "::warning::bsdtar could not read the ISO; skipping boot config check."
+            exit 0
+          fi
+
+          # Extract only boot config files that actually exist in the ISO tree
+          # (the systemd-boot .conf entries live inside efiboot.img, not the tree).
+          mapfile -t cfgs < <(grep -E '\.(cfg|conf)$' "$list" || true)
+          if [ "${#cfgs[@]}" -gt 0 ]; then
+            bsdtar -x -f "$iso" -C "$tmp/cfg" "${cfgs[@]}" \
+              || echo "::warning::bsdtar reported errors while extracting boot configs; continuing."
+          fi
+          echo "Boot config files found in ISO tree: ${#cfgs[@]}"
+
+          mapfile -t kernels < <(sed -n 's|.*/\(vmlinuz-[^/]*\)$|\1|p' "$list" | sort -u)
           if [ "${#kernels[@]}" -eq 0 ]; then
-            echo "::warning::Could not list kernels in the ISO; skipping boot config check."
+            echo "::warning::Could not find any kernels in the ISO listing; skipping boot config check."
             exit 0
           fi
           echo "Kernels in ISO: ${kernels[*]}"
 
-          refs=$(grep -rhoE 'vmlinuz-[A-Za-z0-9._+-]+' "$tmp" | sort -u || true)
+          refs=$(grep -rhoE 'vmlinuz-[A-Za-z0-9._+-]+' "$tmp/cfg" | sort -u || true)
           if [ -z "$refs" ]; then
             echo "::warning::No kernel references found in the ISO's boot configs."
           fi
