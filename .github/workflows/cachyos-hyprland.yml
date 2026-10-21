@@ -329,6 +329,35 @@ jobs:
           fi
           sedx -o cachyos/archiso/efiboot/loader/loader.conf "s|^default .*|default ${DEFAULT_ENTRY}|"
 
+          # --- syslinux (BIOS) ---
+          # This is the menu that prints "Loading /arch/boot/x86_64/vmlinuz-...: failed".
+          SYSLINUX=cachyos/archiso/syslinux
+          if [ ! -d "$SYSLINUX" ]; then
+            echo "PATCH FAIL: $SYSLINUX not found. Contents of cachyos/archiso:" >&2
+            ls -1 cachyos/archiso >&2
+            exit 1
+          fi
+          # Drop whole LABEL stanzas that boot the LTS kernel (no dead menu entries).
+          for f in "$SYSLINUX"/*.cfg; do
+            awk '
+              function flush() { if (buf != "" && buf !~ /linux-cachyos-lts/) printf "%s", buf; buf = "" }
+              tolower($0) ~ /^[ \t]*label[ \t]/ { flush(); buf = $0 ORS; next }
+              buf != "" { buf = buf $0 ORS; next }
+              { print }
+              END { flush() }
+            ' "$f" > "$f.new"
+            mv "$f.new" "$f"
+          done
+
+          # --- Catch-all ---
+          # Anything under archiso/ that still names the LTS kernel gets rewritten,
+          # and LTS-named files (e.g. a linux-cachyos-lts.preset) are deleted.
+          { grep -rIl 'linux-cachyos-lts' cachyos/archiso || true; } | while IFS= read -r f; do
+            echo "catch-all: rewriting LTS reference in $f"
+            sed -i 's|linux-cachyos-lts|linux-cachyos|g' "$f"
+          done
+          find cachyos/archiso -name '*linux-cachyos-lts*' -prune -print -exec rm -rf {} +
+
       - name: Verify patched profile
         run: |
           set -euo pipefail
@@ -350,7 +379,16 @@ jobs:
           for f in etc/greetd/config.toml etc/greetd/hypr-session.sh etc/skel/.config/hypr/hyprland.conf; do
             [ -s "cachyos/archiso/airootfs/$f" ] || { echo "VERIFY FAIL: missing/empty airootfs/$f" >&2; fail=1; }
           done
+          if grep -rIn 'linux-cachyos-lts' cachyos/archiso; then
+            echo "VERIFY FAIL: LTS kernel still referenced under archiso/ (lines above)" >&2; fail=1
+          fi
+          if ! grep -rqE 'vmlinuz-linux-cachyos([^-]|$)' cachyos/archiso/syslinux; then
+            echo "VERIFY FAIL: no syslinux entry boots vmlinuz-linux-cachyos" >&2; fail=1
+          fi
           [ "$fail" -eq 0 ] || exit 1
+
+          echo "--- LTS kernel references outside archiso/ (review, non-fatal) ---"
+          grep -rIn 'linux-cachyos-lts' cachyos --exclude-dir=.git --exclude-dir=archiso || echo "none"
 
           echo "--- Leftover KDE/Plasma/SDDM references in airootfs (review, non-fatal) ---"
           grep -rIil 'plasma\|kwin\|sddm' cachyos/archiso/airootfs || echo "none"
@@ -388,6 +426,34 @@ jobs:
             exit 1
           fi
         working-directory: ${{ github.workspace }}
+
+      - name: Check boot configs against kernels in the ISO
+        run: |
+          set -euo pipefail
+          iso=$(find cachyos/out -name '*.iso' | head -n1)
+          echo "Checking $iso"
+          tmp=$(mktemp -d)
+          bsdtar -x -f "$iso" -C "$tmp" --include='*.cfg' --include='*.conf'
+
+          mapfile -t kernels < <(bsdtar -t -f "$iso" | sed -n 's|.*/\(vmlinuz-[^/]*\)$|\1|p' | sort -u)
+          if [ "${#kernels[@]}" -eq 0 ]; then
+            echo "::warning::Could not list kernels in the ISO; skipping boot config check."
+            exit 0
+          fi
+          echo "Kernels in ISO: ${kernels[*]}"
+
+          refs=$(grep -rhoE 'vmlinuz-[A-Za-z0-9._+-]+' "$tmp" | sort -u || true)
+          if [ -z "$refs" ]; then
+            echo "::warning::No kernel references found in the ISO's boot configs."
+          fi
+          bad=0
+          for ref in $refs; do
+            if ! printf '%s\n' "${kernels[@]}" | grep -qxF "$ref"; then
+              echo "BOOT CHECK FAIL: a boot config references '$ref' but the ISO has no such kernel" >&2
+              bad=1
+            fi
+          done
+          [ "$bad" -eq 0 ]
 
       - name: Check ISO size against release limit
         id: size
