@@ -309,6 +309,51 @@ jobs:
             printf 'bind = $mod SHIFT, %s, movetoworkspace, %s\n' "$i" "$i"
           done >> "$HYPRCONF"
 
+      - name: Patch boot robustness (slow VMs, removed services)
+        run: |
+          set -euo pipefail
+          AIROOT="cachyos/archiso/airootfs"
+          SYSD="$AIROOT/etc/systemd/system"
+          mkdir -p "$SYSD"
+
+          # 1. Drop enable/alias symlinks for services whose packages we removed.
+          #    Fixes: "Failed to preset all unit: dbus-org.freedesktop.ModemManager1.service
+          #    is an unresolvable alias" (modemmanager is in REMOVE but its links remain).
+          if [ -d "$AIROOT/etc/systemd" ]; then
+            for u in ModemManager dbus-org.freedesktop.ModemManager1 \
+                     avahi-daemon avahi-dnsconfd dbus-org.freedesktop.Avahi \
+                     ntpd vboxservice vmtoolsd qemu-guest-agent spice-vdagentd \
+                     bolt dbus-org.freedesktop.bolt pcscd; do
+              find "$AIROOT/etc/systemd" -type l \
+                \( -name "$u.service" -o -name "$u.socket" \) -print -delete
+            done
+          fi
+
+          # 2. Tolerate slow / emulated VMs (no KVM, unstable TSC). The log shows
+          #    journald, nsresourced and drm-module-load.target all hitting their
+          #    start timeouts, which sends cachyos-drm-awaiter to the emergency shell.
+          #    "zz-" sorts last so these override any upstream value.
+          mkdir -p "$SYSD/drm-module-load.target.d" \
+                   "$SYSD/systemd-journald.service.d" \
+                   "$SYSD/systemd-nsresourced.service.d"
+          printf '[Unit]\nJobTimeoutSec=300\n' \
+            > "$SYSD/drm-module-load.target.d/zz-slow-vm.conf"
+          printf '[Service]\nTimeoutStartSec=300\nWatchdogSec=0\n' \
+            > "$SYSD/systemd-journald.service.d/zz-slow-vm.conf"
+          printf '[Service]\nTimeoutStartSec=300\n' \
+            > "$SYSD/systemd-nsresourced.service.d/zz-slow-vm.conf"
+
+          # 3. A live ISO does not need to block on NTP sync; mask the wait unit.
+          ln -sf /dev/null "$SYSD/systemd-time-wait-sync.service"
+
+          # 4. Load common VM GPU drivers up front. In a QEMU virtio-gpu VM the DRM
+          #    device (Virtual-1) only appeared after drm-module-load.target had
+          #    already timed out. Missing modules just log a warning; on real
+          #    hardware these load harmlessly without matching devices.
+          mkdir -p "$AIROOT/etc/modules-load.d"
+          printf 'virtio_gpu\nbochs\nvmwgfx\nhyperv_drm\n' \
+            > "$AIROOT/etc/modules-load.d/vm-gpu.conf"
+
       - name: Patch Boot Entries
         run: |
           set -euo pipefail
@@ -393,6 +438,11 @@ jobs:
           for f in etc/greetd/config.toml etc/greetd/hypr-session.sh etc/skel/.config/hypr/hyprland.conf; do
             [ -s "cachyos/archiso/airootfs/$f" ] || { echo "VERIFY FAIL: missing/empty airootfs/$f" >&2; fail=1; }
           done
+          if find cachyos/archiso/airootfs/etc/systemd -name '*ModemManager*' 2>/dev/null | grep -q .; then
+            echo "VERIFY FAIL: ModemManager unit links still in airootfs" >&2; fail=1
+          fi
+          [ -f cachyos/archiso/airootfs/etc/systemd/system/drm-module-load.target.d/zz-slow-vm.conf ] \
+            || { echo "VERIFY FAIL: slow-VM drop-ins missing" >&2; fail=1; }
           if grep -rIn 'linux-cachyos-lts' cachyos/archiso; then
             echo "VERIFY FAIL: LTS kernel still referenced under archiso/ (lines above)" >&2; fail=1
           fi
