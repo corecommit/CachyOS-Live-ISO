@@ -572,6 +572,9 @@ jobs:
           ls -l /dev/kvm || echo "::warning::/dev/kvm not available; using slow software emulation"
           iso=$(find cachyos/out -name '*.iso' | head -n1)
           echo "Boot testing $iso"
+          qemu-system-x86_64 --version | head -n1
+          uname -r
+          grep -m1 'model name' /proc/cpuinfo || true
 
           cat > /tmp/boot_test.py <<'PY'
           #!/usr/bin/env python3
@@ -625,13 +628,16 @@ jobs:
               except OSError:
                   pass
 
+          class QemuEarlyExit(Exception):
+              pass
+
           class QMP:
               def __init__(self, path, proc):
                   deadline = time.time() + 90
                   while True:
                       if proc.poll() is not None:
                           dump_qemu_log()
-                          sys.exit('FAIL: QEMU exited before QMP was ready (rc=%s)' % proc.returncode)
+                          raise QemuEarlyExit('QEMU exited before QMP was ready (rc=%s)' % proc.returncode)
                       try:
                           s = socket.socket(socket.AF_UNIX)
                           s.connect(path)
@@ -644,7 +650,7 @@ jobs:
                           if time.time() > deadline:
                               time.sleep(2)
                               dump_qemu_log()
-                              sys.exit('FAIL: could not get a QMP greeting (rc=%s)' % proc.poll())
+                              raise QemuEarlyExit('could not get a QMP greeting (rc=%s)' % proc.poll())
                           time.sleep(1)
                   self.cmd('qmp_capabilities')
 
@@ -672,30 +678,55 @@ jobs:
 
           code, vars_src = find_ovmf()
           vars_ = os.path.join(out, 'OVMF_VARS.fd')
-          subprocess.check_call(['cp', vars_src, vars_])
           sock = os.path.join(out, 'qmp.sock')
-          if os.path.exists(sock):
-              os.remove(sock)
 
-          qemu = [
-              'qemu-system-x86_64', '-machine', 'q35',
-              '-accel', 'kvm' if kvm else 'tcg,thread=multi',
-              '-cpu', 'host' if kvm else 'max',
-              '-smp', '4', '-m', '4096',
-              '-drive', 'if=pflash,format=raw,readonly=on,file=' + code,
-              '-drive', 'if=pflash,format=raw,file=' + vars_,
-              '-cdrom', iso, '-boot', 'd',
-              '-vga', 'none', '-device', 'virtio-vga',
-              '-display', 'none',
-              '-nic', 'user,model=virtio-net-pci',
-              '-serial', 'file:' + os.path.join(out, 'serial.log'),
-              '-qmp', 'unix:%s,server=on,wait=off' % sock,
-              '-no-reboot',
-          ]
+          # QEMU itself segfaulted (rc=-11) right at startup with `-accel kvm -cpu host`
+          # on a nested-virt runner, so the ISO never even started. Try progressively
+          # safer accelerator/CPU combos until one gets far enough to answer on QMP.
+          attempts = []
+          if kvm:
+              attempts += [('KVM, -cpu host', 'kvm', 'host'),
+                           ('KVM, -cpu max', 'kvm', 'max')]
+          attempts += [('TCG (software emulation)', 'tcg,thread=multi', 'max')]
+
+          proc = qmp = None
+          for label, accel, cpu in attempts:
+              subprocess.check_call(['cp', vars_src, vars_])
+              if os.path.exists(sock):
+                  os.remove(sock)
+              kvm = accel == 'kvm'
+              qemu = [
+                  'qemu-system-x86_64', '-machine', 'q35',
+                  '-accel', accel, '-cpu', cpu,
+                  '-smp', '4', '-m', '4096',
+                  '-drive', 'if=pflash,format=raw,readonly=on,file=' + code,
+                  '-drive', 'if=pflash,format=raw,file=' + vars_,
+                  '-cdrom', iso, '-boot', 'd',
+                  '-vga', 'none', '-device', 'virtio-vga',
+                  '-display', 'none',
+                  '-nic', 'user,model=virtio-net-pci',
+                  '-serial', 'file:' + os.path.join(out, 'serial.log'),
+                  '-qmp', 'unix:%s,server=on,wait=off' % sock,
+                  '-no-reboot',
+              ]
+              log('attempt: %s' % label)
+              log(' '.join(qemu))
+              proc = subprocess.Popen(qemu, stderr=open(QEMU_LOG, 'w'))
+              try:
+                  qmp = QMP(sock, proc)
+                  break
+              except QemuEarlyExit as e:
+                  log('::warning::%s failed: %s' % (label, e))
+                  if proc.poll() is None:
+                      proc.kill()
+                  proc.wait()
+                  qmp = None
+          if qmp is None:
+              summary('FAIL: ISO boot test - QEMU would not start with any accelerator/CPU combo')
+              sys.exit('FAIL: QEMU crashed on startup with every accelerator/CPU combo; this is a runner/QEMU problem, not the ISO')
+          timeout = int(os.environ.get('BOOT_TIMEOUT_KVM', '900')) if kvm \
+              else int(os.environ.get('BOOT_TIMEOUT_TCG', '2700'))
           log('accel=%s timeout=%ss' % ('kvm' if kvm else 'tcg', timeout))
-          log(' '.join(qemu))
-          proc = subprocess.Popen(qemu, stderr=open(QEMU_LOG, 'w'))
-          qmp = QMP(sock, proc)
 
           def shot(name):
               path = os.path.join(out, name)
