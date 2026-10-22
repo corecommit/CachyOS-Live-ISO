@@ -1,0 +1,314 @@
+name: Boot Test CachyOS Hyprland ISO
+
+# Boots an ALREADY BUILT ISO in QEMU/UEFI and checks that the Hyprland desktop
+# appears. Does not build anything, so it finishes in minutes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Where to get the ISO"
+        type: choice
+        options:
+          - release
+          - artifact
+        default: release
+      release_tag:
+        description: "source=release: tag to test (empty = latest release)"
+        required: false
+        default: ""
+      run_id:
+        description: "source=artifact: build run ID (empty = latest successful build run)"
+        required: false
+        default: ""
+
+jobs:
+  boot-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read     # needed to download artifacts from other runs
+    container:
+      image: archlinux:base
+      options: --privileged
+
+    steps:
+      - name: Install tools
+        run: |
+          pacman -Syu --noconfirm github-cli qemu-base qemu-system-x86 \
+            qemu-hw-display-virtio-vga edk2-ovmf python-pillow libarchive
+
+      - name: Download ISO
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE: ${{ inputs.source }}
+          TAG: ${{ inputs.release_tag }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p iso
+          if [ "$SOURCE" = "release" ]; then
+            if [ -n "$TAG" ]; then
+              gh release download "$TAG" --pattern '*.iso' --pattern '*.sha256' --dir iso
+            else
+              gh release download --pattern '*.iso' --pattern '*.sha256' --dir iso
+            fi
+          else
+            if [ -z "$RUN_ID" ]; then
+              RUN_ID=$(gh run list --workflow cachyos-hyprland.yml --status success \
+                         --limit 1 --json databaseId --jq '.[0].databaseId')
+              [ -n "$RUN_ID" ] || { echo "::error::No successful build run found"; exit 1; }
+            fi
+            echo "Using build run $RUN_ID"
+            gh run download "$RUN_ID" --name cachyos-hyprland-iso --dir iso
+          fi
+          find iso -type f -exec ls -lh {} \;
+          iso=$(find iso -name '*.iso' | head -n1)
+          [ -n "$iso" ] || { echo "::error::No .iso found"; exit 1; }
+          sumfile=$(find iso -name '*.sha256' | head -n1 || true)
+          if [ -n "$sumfile" ]; then
+            want=$(awk '{print $1}' "$sumfile")
+            have=$(sha256sum "$iso" | awk '{print $1}')
+            [ "$want" = "$have" ] && echo "sha256 OK" \
+              || echo "::warning::sha256 mismatch for $iso"
+          fi
+          echo "ISO_PATH=$iso" >> "$GITHUB_ENV"
+
+      - name: Boot test ISO in QEMU (UEFI, wait for Hyprland desktop)
+        run: |
+          set -euo pipefail
+          qemu-system-x86_64 -device help | grep -q 'virtio-vga' || { echo '::error::virtio-vga device missing from QEMU install'; exit 1; }
+          ls -l /dev/kvm || echo "::warning::/dev/kvm not available; using slow software emulation"
+          iso="$ISO_PATH"
+          echo "Boot testing $iso"
+          qemu-system-x86_64 --version | head -n1
+          uname -r
+          grep -m1 'model name' /proc/cpuinfo || true
+
+          cat > /tmp/boot_test.py <<'PY'
+          #!/usr/bin/env python3
+          """Boot the ISO under QEMU/UEFI and decide from screenshots whether
+          the Hyprland session came up. hyprland.conf runs `swaybg -c 1e1e2e`,
+          so a screen dominated by #1e1e2e means greetd autologin -> Hyprland
+          -> exec-once all worked. A black screen, bootloader, or emergency
+          shell text never reaches that threshold."""
+          import glob, json, os, socket, subprocess, sys, time
+          from PIL import Image
+
+          iso, out = sys.argv[1], sys.argv[2]
+          os.makedirs(out, exist_ok=True)
+          kvm = os.access('/dev/kvm', os.W_OK)
+          timeout = int(os.environ.get('BOOT_TIMEOUT_KVM', '900')) if kvm \
+              else int(os.environ.get('BOOT_TIMEOUT_TCG', '2700'))
+          INTERVAL = 15
+          BG = (0x1e, 0x1e, 0x2e)
+          BG_MIN = 0.30
+
+          def log(msg):
+              print(msg, flush=True)
+
+          def summary(msg):
+              p = os.environ.get('GITHUB_STEP_SUMMARY')
+              if p:
+                  with open(p, 'a') as f:
+                      f.write(msg + '\n')
+
+          def find_ovmf():
+              c = sorted(glob.glob('/usr/share/edk2/x64/OVMF_CODE*.fd')
+                         + glob.glob('/usr/share/edk2-ovmf/x64/OVMF_CODE*.fd')
+                         + glob.glob('/usr/share/OVMF/OVMF_CODE*.fd'))
+              c = [x for x in c if 'secboot' not in x and 'snp' not in x]
+              if not c:
+                  sys.exit('FAIL: no OVMF_CODE firmware found')
+              code = c[0]
+              vars_ = code.replace('OVMF_CODE', 'OVMF_VARS')
+              if not os.path.exists(vars_):
+                  sys.exit('FAIL: no matching OVMF_VARS for ' + code)
+              return code, vars_
+
+          QEMU_LOG = os.path.join(out, 'qemu.log')
+
+          def dump_qemu_log():
+              try:
+                  with open(QEMU_LOG) as f:
+                      txt = f.read().strip()
+                  print('---- qemu stderr ----\n' + (txt or '(empty)') + '\n---------------------',
+                        flush=True)
+              except OSError:
+                  pass
+
+          class QemuEarlyExit(Exception):
+              pass
+
+          class QMP:
+              def __init__(self, path, proc):
+                  deadline = time.time() + 90
+                  while True:
+                      if proc.poll() is not None:
+                          dump_qemu_log()
+                          raise QemuEarlyExit('QEMU exited before QMP was ready (rc=%s)' % proc.returncode)
+                      try:
+                          s = socket.socket(socket.AF_UNIX)
+                          s.connect(path)
+                          f = s.makefile('rw')
+                          if not f.readline():  # greeting
+                              raise OSError('empty QMP greeting')
+                          self.s, self.f = s, f
+                          break
+                      except OSError:
+                          if time.time() > deadline:
+                              time.sleep(2)
+                              dump_qemu_log()
+                              raise QemuEarlyExit('could not get a QMP greeting (rc=%s)' % proc.poll())
+                          time.sleep(1)
+                  self.cmd('qmp_capabilities')
+
+              def cmd(self, name, **args):
+                  self.f.write(json.dumps({'execute': name, 'arguments': args}) + '\n')
+                  self.f.flush()
+                  while True:
+                      line = self.f.readline()
+                      if not line:
+                          raise RuntimeError('QMP closed')
+                      msg = json.loads(line)
+                      if 'return' in msg:
+                          return msg['return']
+                      if 'error' in msg:
+                          raise RuntimeError(str(msg['error']))
+
+          def analyze(path):
+              im = Image.open(path).convert('RGB')
+              im = im.resize((max(1, im.width // 4), max(1, im.height // 4)), Image.NEAREST)
+              px = list(im.getdata())
+              n = len(px)
+              nonblack = sum(1 for p in px if max(p) > 16) / n
+              bg = sum(1 for p in px if all(abs(a - b) <= 6 for a, b in zip(p, BG))) / n
+              return nonblack, bg, len(set(px))
+
+          code, vars_src = find_ovmf()
+          vars_ = os.path.join(out, 'OVMF_VARS.fd')
+          sock = os.path.join(out, 'qmp.sock')
+
+          # QEMU itself segfaulted (rc=-11) right at startup with `-accel kvm -cpu host`
+          # on a nested-virt runner, so the ISO never even started. Try progressively
+          # safer accelerator/CPU combos until one gets far enough to answer on QMP.
+          attempts = []
+          if kvm:
+              attempts += [('KVM, -cpu host', 'kvm', 'host'),
+                           ('KVM, -cpu max', 'kvm', 'max')]
+          attempts += [('TCG (software emulation)', 'tcg,thread=multi', 'max')]
+
+          proc = qmp = None
+          for label, accel, cpu in attempts:
+              subprocess.check_call(['cp', vars_src, vars_])
+              if os.path.exists(sock):
+                  os.remove(sock)
+              kvm = accel == 'kvm'
+              qemu = [
+                  'qemu-system-x86_64', '-machine', 'q35',
+                  '-accel', accel, '-cpu', cpu,
+                  '-smp', '4', '-m', '4096',
+                  '-drive', 'if=pflash,format=raw,readonly=on,file=' + code,
+                  '-drive', 'if=pflash,format=raw,file=' + vars_,
+                  '-cdrom', iso, '-boot', 'd',
+                  '-vga', 'none', '-device', 'virtio-vga',
+                  '-display', 'none',
+                  '-nic', 'user,model=virtio-net-pci',
+                  '-serial', 'file:' + os.path.join(out, 'serial.log'),
+                  '-qmp', 'unix:%s,server=on,wait=off' % sock,
+                  '-no-reboot',
+              ]
+              log('attempt: %s' % label)
+              log(' '.join(qemu))
+              proc = subprocess.Popen(qemu, stderr=open(QEMU_LOG, 'w'))
+              try:
+                  qmp = QMP(sock, proc)
+                  break
+              except QemuEarlyExit as e:
+                  log('::warning::%s failed: %s' % (label, e))
+                  if proc.poll() is None:
+                      proc.kill()
+                  proc.wait()
+                  qmp = None
+          if qmp is None:
+              summary('FAIL: ISO boot test - QEMU would not start with any accelerator/CPU combo')
+              sys.exit('FAIL: QEMU crashed on startup with every accelerator/CPU combo; this is a runner/QEMU problem, not the ISO')
+          timeout = int(os.environ.get('BOOT_TIMEOUT_KVM', '900')) if kvm \
+              else int(os.environ.get('BOOT_TIMEOUT_TCG', '2700'))
+          log('accel=%s timeout=%ss' % ('kvm' if kvm else 'tcg', timeout))
+
+          def shot(name):
+              path = os.path.join(out, name)
+              qmp.cmd('screendump', filename=path, format='png')
+              for _ in range(20):  # wait for the file to be written
+                  if os.path.exists(path) and os.path.getsize(path) > 0:
+                      break
+                  time.sleep(0.25)
+              return path
+
+          def finish(ok, msg):
+              try:
+                  shot('final.png')
+                  qmp.cmd('quit')
+              except Exception:
+                  pass
+              try:
+                  proc.wait(timeout=10)
+              except Exception:
+                  proc.kill()
+              (log if ok else lambda m: print('BOOT TEST FAIL: ' + m, file=sys.stderr, flush=True))(msg)
+              summary(('PASS: ' if ok else 'FAIL: ') + 'ISO boot test - ' + msg)
+              sys.exit(0 if ok else 1)
+
+          start = time.time()
+          streak, i = 0, 0
+          keys_sent = set()
+          while time.time() - start < timeout:
+              if proc.poll() is not None:
+                  finish(False, 'QEMU exited early (rc=%s): guest crashed or powered off' % proc.returncode)
+              t = int(time.time() - start)
+              # Press Enter once the bootloader menu is up, in case its timeout is long.
+              for k in (20, 45):
+                  if t >= k and k not in keys_sent:
+                      keys_sent.add(k)
+                      qmp.cmd('send-key', keys=[{'type': 'qcode', 'data': 'ret'}])
+              path = shot('sample_%03d.png' % i)
+              i += 1
+              nonblack, bg, colors = analyze(path)
+              log('[t=%4ds] nonblack=%.2f bg(1e1e2e)=%.2f colors=%d' % (t, nonblack, bg, colors))
+              if bg >= BG_MIN:
+                  streak += 1
+              else:
+                  streak = 0
+              if streak >= 2:
+                  log('Desktop background detected; waiting 30s to confirm Hyprland stays up...')
+                  time.sleep(30)
+                  path = shot('confirm.png')
+                  nonblack, bg, colors = analyze(path)
+                  log('confirm: nonblack=%.2f bg=%.2f colors=%d' % (nonblack, bg, colors))
+                  if bg < BG_MIN:
+                      streak = 0
+                      continue
+                  if colors < 8:
+                      print('::warning::Desktop background is up but the screen has almost no '
+                            'other content; waybar may not be running.', flush=True)
+                  finish(True, 'Hyprland desktop visible after ~%ds (%s)' % (t, 'KVM' if kvm else 'TCG'))
+              time.sleep(INTERVAL)
+          finish(False, 'no Hyprland desktop within %ds; see boot-test screenshots artifact' % timeout)
+          PY
+
+          python3 /tmp/boot_test.py "$iso" boottest-out
+
+      - name: Upload boot test screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-test-screenshots
+          path: |
+            boottest-out/*.png
+            boottest-out/serial.log
+            boottest-out/qemu.log
+          if-no-files-found: ignore
+          retention-days: 14
