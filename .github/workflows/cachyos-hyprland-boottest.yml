@@ -30,15 +30,17 @@ jobs:
     permissions:
       contents: read
       actions: read     # needed to download artifacts from other runs
-    container:
-      image: archlinux:base
-      options: --privileged
 
     steps:
+      # Runs on the plain Ubuntu runner (not the Arch container): Arch's QEMU
+      # 11.1.2 segfaults at startup even with TCG, Ubuntu's stable QEMU does not.
       - name: Install tools
         run: |
-          pacman -Syu --noconfirm github-cli qemu-base qemu-system-x86 \
-            qemu-hw-display-virtio-vga edk2-ovmf python-pillow libarchive
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 ovmf python3-pil
+          # Let the unprivileged runner user open /dev/kvm
+          if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; fi
 
       - name: Download ISO
         env:
@@ -144,7 +146,7 @@ jobs:
               c = sorted(glob.glob('/usr/share/edk2/x64/OVMF_CODE*.fd')
                          + glob.glob('/usr/share/edk2-ovmf/x64/OVMF_CODE*.fd')
                          + glob.glob('/usr/share/OVMF/OVMF_CODE*.fd'))
-              c = [x for x in c if 'secboot' not in x and 'snp' not in x]
+              c = [x for x in c if 'secboot' not in x and 'snp' not in x and '.ms.' not in x]
               if not c:
                   sys.exit('FAIL: no OVMF_CODE firmware found')
               code = c[0]
