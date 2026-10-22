@@ -567,8 +567,8 @@ jobs:
         timeout-minutes: 60
         run: |
           set -euo pipefail
-          pacman -S --noconfirm --needed qemu-base edk2-ovmf python-pillow
-          command -v qemu-system-x86_64 >/dev/null || pacman -S --noconfirm --needed qemu-system-x86
+          pacman -S --noconfirm --needed qemu-base qemu-system-x86 qemu-hw-display-virtio-vga edk2-ovmf python-pillow
+          qemu-system-x86_64 -device help | grep -q 'virtio-vga' || { echo '::error::virtio-vga device missing from QEMU install'; exit 1; }
           ls -l /dev/kvm || echo "::warning::/dev/kvm not available; using slow software emulation"
           iso=$(find cachyos/out -name '*.iso' | head -n1)
           echo "Boot testing $iso"
@@ -615,8 +615,10 @@ jobs:
               return code, vars_
 
           class QMP:
-              def __init__(self, path):
+              def __init__(self, path, proc):
                   for _ in range(60):
+                      if proc.poll() is not None:
+                          sys.exit('FAIL: QEMU exited before QMP was ready (rc=%s); see its error above' % proc.returncode)
                       try:
                           self.s = socket.socket(socket.AF_UNIX)
                           self.s.connect(path)
@@ -676,7 +678,7 @@ jobs:
           log('accel=%s timeout=%ss' % ('kvm' if kvm else 'tcg', timeout))
           log(' '.join(qemu))
           proc = subprocess.Popen(qemu)
-          qmp = QMP(sock)
+          qmp = QMP(sock, proc)
 
           def shot(name):
               path = os.path.join(out, name)
