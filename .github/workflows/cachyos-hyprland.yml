@@ -614,21 +614,38 @@ jobs:
                   sys.exit('FAIL: no matching OVMF_VARS for ' + code)
               return code, vars_
 
+          QEMU_LOG = os.path.join(out, 'qemu.log')
+
+          def dump_qemu_log():
+              try:
+                  with open(QEMU_LOG) as f:
+                      txt = f.read().strip()
+                  print('---- qemu stderr ----\n' + (txt or '(empty)') + '\n---------------------',
+                        flush=True)
+              except OSError:
+                  pass
+
           class QMP:
               def __init__(self, path, proc):
-                  for _ in range(60):
+                  deadline = time.time() + 90
+                  while True:
                       if proc.poll() is not None:
-                          sys.exit('FAIL: QEMU exited before QMP was ready (rc=%s); see its error above' % proc.returncode)
+                          dump_qemu_log()
+                          sys.exit('FAIL: QEMU exited before QMP was ready (rc=%s)' % proc.returncode)
                       try:
-                          self.s = socket.socket(socket.AF_UNIX)
-                          self.s.connect(path)
+                          s = socket.socket(socket.AF_UNIX)
+                          s.connect(path)
+                          f = s.makefile('rw')
+                          if not f.readline():  # greeting
+                              raise OSError('empty QMP greeting')
+                          self.s, self.f = s, f
                           break
                       except OSError:
+                          if time.time() > deadline:
+                              time.sleep(2)
+                              dump_qemu_log()
+                              sys.exit('FAIL: could not get a QMP greeting (rc=%s)' % proc.poll())
                           time.sleep(1)
-                  else:
-                      sys.exit('FAIL: could not connect to QMP socket')
-                  self.f = self.s.makefile('rw')
-                  self.f.readline()  # greeting
                   self.cmd('qmp_capabilities')
 
               def cmd(self, name, **args):
@@ -677,7 +694,7 @@ jobs:
           ]
           log('accel=%s timeout=%ss' % ('kvm' if kvm else 'tcg', timeout))
           log(' '.join(qemu))
-          proc = subprocess.Popen(qemu)
+          proc = subprocess.Popen(qemu, stderr=open(QEMU_LOG, 'w'))
           qmp = QMP(sock, proc)
 
           def shot(name):
@@ -760,6 +777,7 @@ jobs:
           path: |
             boottest-out/*.png
             boottest-out/serial.log
+            boottest-out/qemu.log
           if-no-files-found: ignore
           retention-days: 14
 
