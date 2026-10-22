@@ -15,6 +15,11 @@ on:
     tags:
       - 'cachyos-v*'
 
+# One build per ref at a time; tag (release) builds are never cancelled.
+concurrency:
+  group: cachyos-hyprland-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 env:
   # Paste a commit SHA from CachyOS/CachyOS-Live-ISO here to pin the upstream.
   # Empty = default branch. The clone step logs the SHA it used, so copy it
@@ -309,7 +314,7 @@ jobs:
             printf 'bind = $mod SHIFT, %s, movetoworkspace, %s\n' "$i" "$i"
           done >> "$HYPRCONF"
 
-      - name: Patch boot robustness (slow VMs, removed services)
+      - name: Patch boot robustness (slow VMs, removed services, networking)
         run: |
           set -euo pipefail
           AIROOT="cachyos/archiso/airootfs"
@@ -353,6 +358,17 @@ jobs:
           mkdir -p "$AIROOT/etc/modules-load.d"
           printf 'virtio_gpu\nbochs\nvmwgfx\nhyperv_drm\n' \
             > "$AIROOT/etc/modules-load.d/vm-gpu.conf"
+
+          # 5. Enable NetworkManager (build-time equivalent of
+          #    `systemctl enable NetworkManager`). `--now` is meaningless here:
+          #    there is no running systemd inside the airootfs. nm-applet in the
+          #    Hyprland autostart needs this service. wait-online is deliberately
+          #    NOT enabled; it only slows boot.
+          mkdir -p "$SYSD/multi-user.target.wants"
+          ln -sf /usr/lib/systemd/system/NetworkManager.service \
+            "$SYSD/multi-user.target.wants/NetworkManager.service"
+          ln -sf /usr/lib/systemd/system/NetworkManager-dispatcher.service \
+            "$SYSD/dbus-org.freedesktop.nm-dispatcher.service"
 
       - name: Patch Boot Entries
         run: |
@@ -443,6 +459,8 @@ jobs:
           fi
           [ -f cachyos/archiso/airootfs/etc/systemd/system/drm-module-load.target.d/zz-slow-vm.conf ] \
             || { echo "VERIFY FAIL: slow-VM drop-ins missing" >&2; fail=1; }
+          [ -L cachyos/archiso/airootfs/etc/systemd/system/multi-user.target.wants/NetworkManager.service ] \
+            || { echo "VERIFY FAIL: NetworkManager not enabled" >&2; fail=1; }
           if grep -rIn 'linux-cachyos-lts' cachyos/archiso; then
             echo "VERIFY FAIL: LTS kernel still referenced under archiso/ (lines above)" >&2; fail=1
           fi
@@ -476,9 +494,12 @@ jobs:
 
           rm -rf build/ work/ out/*
 
+          # Keep a copy of the full log so a failed build can be inspected
+          # from the "build-log" artifact instead of scrolling the Actions UI.
           set +e
-          sudo -H -E -u builder ./buildiso.sh -p desktop -v -w
-          build_rc=$?
+          sudo -H -E -u builder ./buildiso.sh -p desktop -v -w 2>&1 \
+            | tee "$GITHUB_WORKSPACE/build.log"
+          build_rc=${PIPESTATUS[0]}
           set -e
           echo "buildiso.sh exit code: $build_rc"
 
@@ -493,6 +514,15 @@ jobs:
             exit 1
           fi
         working-directory: ${{ github.workspace }}
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Check boot configs against kernels in the ISO
         run: |
@@ -555,6 +585,26 @@ jobs:
             echo "::warning::$msg"
             echo "$msg" >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Ensure checksums and write summary
+        run: |
+          set -euo pipefail
+          {
+            echo "### Built ISO"
+            echo ""
+            echo "| File | Size | SHA-256 |"
+            echo "|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r iso; do
+            dir=$(dirname "$iso"); base=$(basename "$iso")
+            # Create a .sha256 only if upstream did not already produce one.
+            if [ ! -f "$iso.sha256" ]; then
+              (cd "$dir" && sha256sum "$base" > "$base.sha256")
+            fi
+            sum=$(cut -d' ' -f1 "$iso.sha256")
+            size=$(du -h "$iso" | cut -f1)
+            echo "| \`$base\` | $size | \`$sum\` |" >> "$GITHUB_STEP_SUMMARY"
+          done < <(find cachyos/out -name '*.iso')
 
       - name: Upload ISO as Artifact
         uses: actions/upload-artifact@v4
