@@ -7,18 +7,19 @@ on:
   workflow_dispatch:
     inputs:
       source:
-        description: "Where to get the ISO"
+        description: "Where to get the ISO (auto = try release first, then build artifact)"
         type: choice
         options:
+          - auto
           - release
           - artifact
-        default: release
+        default: auto
       release_tag:
-        description: "source=release: tag to test (empty = latest release)"
+        description: "Release tag to test (empty = latest release)"
         required: false
         default: ""
       run_id:
-        description: "source=artifact: build run ID (empty = latest successful build run)"
+        description: "Build run ID to take the artifact from (empty = latest successful build run)"
         required: false
         default: ""
 
@@ -49,21 +50,45 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p iso
-          if [ "$SOURCE" = "release" ]; then
+
+          from_release() {
+            echo "Trying release (${TAG:-latest})..."
+            rm -rf iso/*
             if [ -n "$TAG" ]; then
               gh release download "$TAG" --pattern '*.iso' --pattern '*.sha256' --dir iso
             else
               gh release download --pattern '*.iso' --pattern '*.sha256' --dir iso
             fi
-          else
-            if [ -z "$RUN_ID" ]; then
-              RUN_ID=$(gh run list --workflow cachyos-hyprland.yml --status success \
-                         --limit 1 --json databaseId --jq '.[0].databaseId')
-              [ -n "$RUN_ID" ] || { echo "::error::No successful build run found"; exit 1; }
+            [ -n "$(find iso -name '*.iso' | head -n1)" ]
+          }
+
+          from_artifact() {
+            local id="$RUN_ID"
+            if [ -z "$id" ]; then
+              id=$(gh run list --workflow cachyos-hyprland.yml --status success \
+                     --limit 1 --json databaseId --jq '.[0].databaseId // empty')
             fi
-            echo "Using build run $RUN_ID"
-            gh run download "$RUN_ID" --name cachyos-hyprland-iso --dir iso
-          fi
+            [ -n "$id" ] || { echo "No successful build run found"; return 1; }
+            echo "Trying artifact from build run $id..."
+            rm -rf iso/*
+            gh run download "$id" --name cachyos-hyprland-iso --dir iso
+            [ -n "$(find iso -name '*.iso' | head -n1)" ]
+          }
+
+          case "$SOURCE" in
+            release)  from_release  ;;
+            artifact) from_artifact ;;
+            *)
+              if from_release; then
+                echo "Using release ISO"
+              elif from_artifact; then
+                echo "Using build artifact ISO"
+              else
+                echo "::error::No ISO found in any release or in a successful build run's artifacts (artifacts expire after 30 days, and releases are skipped for ISOs >= 2 GiB)."
+                exit 1
+              fi
+              ;;
+          esac
           find iso -type f -exec ls -lh {} \;
           iso=$(find iso -name '*.iso' | head -n1)
           [ -n "$iso" ] || { echo "::error::No .iso found"; exit 1; }
